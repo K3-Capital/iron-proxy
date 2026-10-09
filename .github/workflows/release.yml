@@ -12,7 +12,11 @@ permissions:
 
 jobs:
   iron-proxy:
-    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v')
+    # The upstream release path publishes to Docker Hub with GoReleaser Pro
+    # credentials and belongs to the upstream repository only. Pushes and
+    # tags in K3-Capital/iron-proxy must not use it; the K3 fork publishes
+    # through its own workflow instead.
+    if: github.repository == 'paradigmxyz/iron-proxy' && (github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
