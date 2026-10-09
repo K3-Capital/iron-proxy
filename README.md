@@ -463,16 +463,43 @@ values before forwarding upstream. You control where it looks:
 - **`match_query`:** scan the URL query string. Defaults to `false`; opt in for
   upstreams that expect the secret in a query parameter. Query strings often
   appear in access logs on either side of the proxy, so this is off by default.
+- **`match_query_params`:** exact, case-sensitive list of query parameter names
+  to scan. When set, only the values of the listed parameters are rewritten;
+  the names are matched against the decoded keys (so `["my key"]` selects
+  `my%20key`) and are used exactly as written. Every other byte of the query —
+  encoded keys, separators, ordering, empty segments, duplicate keys, unrelated
+  values — is preserved verbatim, and changed values are URL-escaped once
+  (this replaces the legacy whole-query re-encode). The list must be non-empty
+  with non-empty, unique names, and cannot be combined with `match_query: true`.
+  If a matching request's query fails to parse (bad percent-escape, raw `;`),
+  the request is rejected with 403 before any mutation instead of being
+  forwarded with a partial parse. Omitting the field (or setting it to null)
+  keeps the legacy whole-query behavior. Header, path and body scanning are
+  unaffected.
 - **`match_path`:** scan the URL path. Defaults to `false`; opt in for upstreams
   like Telegram that embed the secret in the path (e.g.
   `/bot<TOKEN>/sendMessage`). URL paths often appear in access logs on either
   side of the proxy, so this is off by default.
 - **`require`:** when `true`, requests to a matching host that do **not** contain
   the proxy token are rejected with 403. This prevents a compromised workload
-  from bypassing the secret-swap mechanism with alternative credentials. Default: `false`.
+  from bypassing the secret-swap mechanism with alternative credentials. With
+  `match_query_params`, the token must appear in one of the selected query
+  parameter values. Default: `false`.
 - **`hosts`:** restrict swapping to specific domains or CIDRs.
 
-Query parameters are always scanned.
+Query scanning is opt-in. To swap a token in exactly one query parameter while
+leaving headers, body and path untouched:
+
+```yaml
+replace:
+  proxy_value: "proxy-token-123"
+  match_headers: ["/a^/"]   # a regexp that no header name can match
+  match_query: false
+  match_query_params: ["apikey"]
+  match_body: false
+  match_path: false
+  require: true
+```
 
 Secret sources:
 

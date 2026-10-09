@@ -27,6 +27,10 @@ jobs:
         if: always()
 
   integration-test:
+    # This job consumes provider/registry credentials and belongs to the
+    # upstream repository only. It must not run in K3-Capital/iron-proxy,
+    # where CI stays secret-free.
+    if: github.repository == 'paradigmxyz/iron-proxy'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -198,6 +198,26 @@ transforms:
         #   rules:
         #     - host: "maps.googleapis.com"
 
+        # Replace mode with an exact named-query selector. Only the values of
+        # the listed query parameters are rewritten; every other byte of the
+        # query is preserved. match_headers: ["/a^/"] is the documented way to
+        # disable header scanning (no header name can match that regexp).
+        # match_query_params cannot be combined with match_query: true, and
+        # requests whose query fails to parse are rejected with 403.
+        # - source:
+        #     type: env
+        #     var: MAPS_API_KEY
+        #   replace:
+        #     proxy_value: "proxy-maps-token-123"
+        #     match_headers: ["/a^/"]    # disable header scanning if query-only
+        #     match_query: false
+        #     match_query_params: ["apikey"]
+        #     match_body: false
+        #     match_path: false
+        #     require: true
+        #   rules:
+        #     - host: "maps.googleapis.com"
+
         # Replace mode with AWS Secrets Manager and background refresh:
         # - source:
         #     type: aws_sm
