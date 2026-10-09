@@ -1,0 +1,7 @@
+# Patterns are relative to the dist/k3 build context, not the source checkout.
+**
+!linux/
+!linux/amd64/
+!linux/arm64/
+!linux/amd64/iron-proxy
+!linux/arm64/iron-proxy

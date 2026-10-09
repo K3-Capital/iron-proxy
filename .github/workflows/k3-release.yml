@@ -1,0 +1,197 @@
+name: K3 build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*-k3.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k3-release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Never inherit provider credentials. The only registry credential is in publish.
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    if: github.repository == 'K3-Capital/iron-proxy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: ironsh/iron-proxy-action@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        with:
+          egress-rules: egress-rules.k3.yaml
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify modules and run synthetic unit/race, vet and build gates
+        run: |
+          go mod download
+          go mod verify
+          go test -race -count=1 ./...
+          go vet ./...
+          go build -mod=readonly ./cmd/iron-proxy
+          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+          git diff --exit-code -- go.mod go.sum
+      - name: Check workflows with pinned actionlint
+        run: |
+          GOBIN="$RUNNER_TEMP/actionlint" go install github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+          "$RUNNER_TEMP/actionlint/actionlint" -color
+      - uses: ironsh/iron-proxy-action/summary@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        if: always()
+
+  package:
+    if: github.repository == 'K3-Capital/iron-proxy'
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.binaries.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ironsh/iron-proxy-action@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        with:
+          egress-rules: egress-rules.k3.yaml
+          disable-docker: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build the two host binaries once
+        id: binaries
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: python3 scripts/release/release.py build
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: v0.27.0
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.24.0@sha256:6eceb8971ce4fceb3daca562832642706238b7eea72941fcf9896c93c3c4a53e
+      - name: Build both OCI platforms without login or publication
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: dist/k3
+          file: Dockerfile.k3
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/k3-image.tar,compression=gzip
+          provenance: mode=max
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/K3-Capital/iron-proxy
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+            org.opencontainers.image.version=${{ steps.binaries.outputs.version }}
+            io.github.k3-capital.workflow.sha=${{ github.workflow_sha }}
+      - name: Verify image layers, labels and provenance against the archived bytes
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: python3 scripts/release/release.py verify-oci "$RUNNER_TEMP/k3-image.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: k3-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/k3/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+      - uses: ironsh/iron-proxy-action/summary@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        if: always()
+
+  publish:
+    # Only a newly created, non-forced K3 tag push in this repository is trusted.
+    # build validates the complete version grammar before this job can start.
+    if: >-
+      github.repository == 'K3-Capital/iron-proxy' &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.event.created == true && github.event.deleted == false && github.event.forced == false &&
+      startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-k3.')
+    needs: [verify, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ironsh/iron-proxy-action@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        with:
+          egress-rules: egress-rules.k3.yaml
+          disable-docker: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: k3-candidate-${{ github.sha }}
+          path: dist/k3
+      - name: Validate candidate identity and refuse an existing registry tag
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          VERSION: ${{ needs.package.outputs.version }}
+        run: python3 scripts/release/release.py preflight
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: v0.27.0
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.24.0@sha256:6eceb8971ce4fceb3daca562832642706238b7eea72941fcf9896c93c3c4a53e
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the deliberate K3 version
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: dist/k3
+          file: Dockerfile.k3
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/k3-capital/iron-proxy:${{ needs.package.outputs.version }}
+          outputs: type=image,push=true,oci-mediatypes=true,compression=gzip
+          provenance: mode=max
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/K3-Capital/iron-proxy
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.package.outputs.version }}
+            io.github.k3-capital.workflow.sha=${{ github.workflow_sha }}
+      - name: Read back the exact index, both platform layers and build provenance
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: python3 scripts/release/release.py verify-registry
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: k3-release-${{ needs.package.outputs.version }}-${{ github.sha }}
+          path: dist/k3/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          overwrite: false
+      - uses: ironsh/iron-proxy-action/summary@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
+        if: always()
