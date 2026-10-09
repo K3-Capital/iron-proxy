@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -51,7 +52,37 @@ type replaceConfig struct {
 	MatchBody    bool     `yaml:"match_body,omitempty"`
 	MatchPath    bool     `yaml:"match_path,omitempty"`
 	MatchQuery   bool     `yaml:"match_query,omitempty"`
-	Require      bool     `yaml:"require,omitempty"`
+	// MatchQueryParams selects exact, already-decoded, case-sensitive query
+	// parameter names to scan. Non-nil switches query scanning to the named
+	// mode; nil (omitted or null) keeps the legacy whole-query behavior
+	// controlled by MatchQuery.
+	MatchQueryParams matchQueryParams `yaml:"match_query_params,omitempty"`
+	Require          bool             `yaml:"require,omitempty"`
+}
+
+// matchQueryParams is the replace.match_query_params configuration type. It
+// requires every entry to be a string scalar: yaml.v3 otherwise coerces
+// scalars like `[1]` or `[true]` into element strings, which would silently
+// turn a mistyped entry into a parameter name.
+type matchQueryParams []string
+
+// UnmarshalYAML implements yaml.Unmarshaler. Null values never reach it:
+// yaml.v3 decodes null into the zero value, so an omitted or null field
+// stays nil (legacy mode) while `[]` yields a non-nil empty list that
+// validation rejects.
+func (m *matchQueryParams) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("match_query_params must be a list of parameter names (line %d)", node.Line)
+	}
+	names := make(matchQueryParams, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item.Kind != yaml.ScalarNode || item.ShortTag() != "!!str" {
+			return fmt.Errorf("match_query_params entries must be strings (line %d)", item.Line)
+		}
+		names = append(names, item.Value)
+	}
+	*m = names
+	return nil
 }
 
 type injectConfig struct {
@@ -70,12 +101,13 @@ type resolvedSecret struct {
 	rules  []hostmatch.Rule
 
 	// replace mode fields
-	proxyValue   string
-	matchHeaders []headerMatcher // empty = all headers
-	matchBody    bool
-	matchPath    bool
-	matchQuery   bool
-	require      bool
+	proxyValue       string
+	matchHeaders     []headerMatcher // empty = all headers
+	matchBody        bool
+	matchPath        bool
+	matchQuery       bool
+	matchQueryParams []string // non-nil = named-query selector; exact decoded names
+	require          bool
 
 	// inject mode fields
 	injectHeader     string
@@ -241,15 +273,16 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				return nil, err
 			}
 			resolved = append(resolved, resolvedSecret{
-				source:       source,
-				mode:         "replace",
-				proxyValue:   replace.ProxyValue,
-				matchHeaders: matchers,
-				matchBody:    replace.MatchBody,
-				matchPath:    replace.MatchPath,
-				matchQuery:   replace.MatchQuery,
-				require:      replace.Require,
-				rules:        rules,
+				source:           source,
+				mode:             "replace",
+				proxyValue:       replace.ProxyValue,
+				matchHeaders:     matchers,
+				matchBody:        replace.MatchBody,
+				matchPath:        replace.MatchPath,
+				matchQuery:       replace.MatchQuery,
+				matchQueryParams: replace.MatchQueryParams,
+				require:          replace.Require,
+				rules:            rules,
 			})
 		}
 	}
@@ -300,6 +333,9 @@ func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, e
 		if entry.Replace.ProxyValue == "" {
 			return nil, nil, fmt.Errorf("secrets[%d]: replace.proxy_value is required", i)
 		}
+		if err := validateReplaceQueryParams(i, entry.Replace); err != nil {
+			return nil, nil, err
+		}
 		return entry.Replace, nil, nil
 	}
 
@@ -328,6 +364,32 @@ func validateInject(i int, cfg *injectConfig) error {
 	return nil
 }
 
+// validateReplaceQueryParams validates the optional named-query selector.
+// A nil selector (field omitted or null) selects the legacy whole-query
+// behavior; configured names are kept exactly as written.
+func validateReplaceQueryParams(i int, cfg *replaceConfig) error {
+	if cfg.MatchQueryParams == nil {
+		return nil
+	}
+	if cfg.MatchQuery {
+		return fmt.Errorf("secrets[%d]: replace.match_query: true cannot be combined with match_query_params", i)
+	}
+	if len(cfg.MatchQueryParams) == 0 {
+		return fmt.Errorf("secrets[%d]: replace.match_query_params must not be empty", i)
+	}
+	seen := make(map[string]struct{}, len(cfg.MatchQueryParams))
+	for _, name := range cfg.MatchQueryParams {
+		if name == "" {
+			return fmt.Errorf("secrets[%d]: replace.match_query_params must not contain an empty parameter name", i)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("secrets[%d]: replace.match_query_params contains duplicate parameter name %q", i, name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
 func (s *Secrets) Name() string { return "secrets" }
 
 func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
@@ -344,6 +406,29 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 
 		name := sec.source.Name()
+
+		// Named-query mode: validate the complete query and, when the
+		// secret is required, the selected placement before resolving the
+		// secret or mutating anything. The per-request segments computed
+		// here are reused for the swap.
+		var namedSegs []querySegment
+		if sec.matchQueryParams != nil {
+			segs, err := splitQuerySegments(req.URL.RawQuery)
+			if err != nil {
+				// url.ParseQuery error text can quote raw query bytes, so
+				// record a fixed reason instead of the error.
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("reject_reason", "malformed_query")
+				return &transform.TransformResult{Action: transform.ActionReject}, nil
+			}
+			if sec.require && !selectedQueryHasToken(segs, sec.matchQueryParams, sec.proxyValue) {
+				tctx.Annotate("rejected", name)
+				tctx.Annotate("reject_reason", "query_token_missing")
+				return &transform.TransformResult{Action: transform.ActionReject}, nil
+			}
+			namedSegs = segs
+		}
+
 		realValue, err := sec.source.Get(ctx)
 		if err != nil {
 			if sec.require {
@@ -369,7 +454,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		var locations []string
 		locations = append(locations, s.swapHeaders(req, &sec, realValue)...)
 
-		if sec.matchQuery {
+		if sec.matchQueryParams != nil {
+			locations = append(locations, s.swapNamedQuery(req, namedSegs, &sec, realValue)...)
+		} else if sec.matchQuery {
 			locations = append(locations, s.swapQuery(req, &sec, realValue)...)
 		}
 
@@ -552,6 +639,102 @@ func (s *Secrets) swapQuery(req *http.Request, sec *resolvedSecret, realValue st
 	if len(locations) > 0 {
 		req.URL.RawQuery = params.Encode()
 	}
+	return locations
+}
+
+// querySegment is one ampersand-delimited piece of a raw query string with
+// its key and value decoded exactly once.
+type querySegment struct {
+	rawKey   string // the original encoded key
+	rawValue string // the original encoded value ("" when the segment has no '=')
+	key      string // the decoded key
+	value    string // the decoded value
+	hasEq    bool   // whether the segment contains '='
+}
+
+// splitQuerySegments validates raw with the standard query parser and then
+// splits it into ampersand-delimited segments, decoding each key and value
+// once. A malformed query yields the parser error so the caller can reject
+// the request instead of forwarding a partial parse.
+func splitQuerySegments(raw string) ([]querySegment, error) {
+	if _, err := url.ParseQuery(raw); err != nil {
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, "&")
+	segs := make([]querySegment, 0, len(parts))
+	for _, part := range parts {
+		rawKey, rawValue, hasEq := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			// Unreachable when url.ParseQuery accepted the query above;
+			// reject defensively rather than forward undecodable bytes.
+			return nil, err
+		}
+		value := ""
+		if hasEq {
+			value, err = url.QueryUnescape(rawValue)
+			if err != nil {
+				return nil, err
+			}
+		}
+		segs = append(segs, querySegment{
+			rawKey:   rawKey,
+			rawValue: rawValue,
+			key:      key,
+			value:    value,
+			hasEq:    hasEq,
+		})
+	}
+	return segs, nil
+}
+
+// selectedQueryHasToken reports whether any selected parameter's decoded
+// value contains the proxy token.
+func selectedQueryHasToken(segs []querySegment, selected []string, token string) bool {
+	for _, seg := range segs {
+		if slices.Contains(selected, seg.key) && strings.Contains(seg.value, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// swapNamedQuery replaces every proxy-token occurrence inside the decoded
+// values of the selected query parameters. Only changed values are
+// re-encoded; encoded keys and every untouched segment keep their original
+// bytes, so unrelated query data is preserved verbatim.
+func (s *Secrets) swapNamedQuery(req *http.Request, segs []querySegment, sec *resolvedSecret, realValue string) []string {
+	var locations []string
+	for i := range segs {
+		seg := &segs[i]
+		if !slices.Contains(sec.matchQueryParams, seg.key) {
+			continue
+		}
+		if !strings.Contains(seg.value, sec.proxyValue) {
+			continue
+		}
+		seg.rawValue = url.QueryEscape(strings.ReplaceAll(seg.value, sec.proxyValue, realValue))
+		locations = append(locations, "query:"+seg.key)
+	}
+	if len(locations) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	for i := range segs {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(segs[i].rawKey)
+		if segs[i].hasEq {
+			b.WriteByte('=')
+			b.WriteString(segs[i].rawValue)
+		}
+	}
+	req.URL.RawQuery = b.String()
 	return locations
 }
 
