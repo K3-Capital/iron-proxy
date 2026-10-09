@@ -1,0 +1,18 @@
+# Build dependencies only. No provider integrations or proprietary release APIs.
+domains:
+  - "proxy.golang.org"
+  - "sum.golang.org"
+  - "storage.googleapis.com" # Go module/toolchain download storage, not GCP APIs
+  - "go.dev"
+  - "*.go.dev"
+  - "golang.org"
+  - "*.golang.org"
+  - "google.golang.org" # gRPC/protobuf modules
+  - "github.com"
+  - "*.github.com"
+  - "*.githubusercontent.com"
+  - "ghcr.io"
+  - "*.pkg.github.com" # GHCR blob storage
+  - "auth.docker.io"
+  - "registry-1.docker.io" # pinned Alpine and BuildKit pulls; never Docker Hub login
+  - "production.cloudflare.docker.com"
