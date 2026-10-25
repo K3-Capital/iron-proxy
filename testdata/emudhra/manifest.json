@@ -1,0 +1,156 @@
+{
+  "inventory_version": 1,
+  "description": "Public eMudhra forged-chain fixtures used to prove that a candidate release image no longer trusts the compromised hierarchy. Contains public certificates only; no private keys.",
+  "source": {
+    "url": "https://emudhra.we-have-a-problem.com/chains.zip",
+    "archive_sha256": "7b949956955fc501a30f4d98d2f513d34c0bbbe92e29a968194c96e097ce2345",
+    "archive_size_bytes": 27588,
+    "archive_member_count": 15,
+    "archive_member_prefix": "chains/",
+    "fetched_on": "2026-10-25",
+    "inventory_update_policy": "A changed archive or any change to a fixture file requires an explicit reviewed inventory update. Do not auto-accept new fixtures."
+  },
+  "layout": "Each fixture holds the leaf certificate first, followed by the untrusted intermediates. Verify with the leaf file as both -untrusted and the target.",
+  "reference_time_unix": 1792800000,
+  "reference_time_utc": "2026-10-24T00:00:00Z",
+  "fixtures": [
+    {
+      "file": "dv-g3b-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3b-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "3641ff8e872e4c90d5691edb09894914121b267e6a50455347c5f28708fa1af2",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:41 2026 GMT",
+      "leaf_not_after": "May  3 02:27:41 2027 GMT"
+    },
+    {
+      "file": "dv-g3b-aaa-noct-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3b-aaa-noct-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa-noct",
+      "sha256": "a360266958b7dfc04250553f6a5f55be769457f126bfd4de415bbaffc9cf62ad",
+      "certificates": 2,
+      "leaf_not_before": "Oct 22 13:14:48 2026 GMT",
+      "leaf_not_after": "May  5 13:19:48 2027 GMT"
+    },
+    {
+      "file": "dv-g3b-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3b-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "ab6483de0cb01d53d59275baf74d2766f3599e57a48d3319e4a5536c268ac696",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:36 2026 GMT",
+      "leaf_not_after": "May  3 01:04:36 2027 GMT"
+    },
+    {
+      "file": "dv-g3b-noct-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3b-noct-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra-noct",
+      "sha256": "de597b4e346d6e84d264a6bc62f5cb5bf4a4d64ec5e587edc446016e4aa693c5",
+      "certificates": 3,
+      "leaf_not_before": "Oct 22 12:57:31 2026 GMT",
+      "leaf_not_after": "May  5 13:02:31 2027 GMT"
+    },
+    {
+      "file": "dv-g3c-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3c-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "23641e6de1b0c5a452bd0aaaaa1647863cf5daf27e0b62611ea9289dc0106d39",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:41 2026 GMT",
+      "leaf_not_after": "May  3 02:27:41 2027 GMT"
+    },
+    {
+      "file": "dv-g3c-emudhra.we-have-a-problem.com.pem",
+      "host": "dv-g3c-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "370e97ac882a900d25bda5b8ffe0136197e41d1ab424c3f04adad77825283803",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:36 2026 GMT",
+      "leaf_not_after": "May  3 01:04:36 2027 GMT"
+    },
+    {
+      "file": "ev-g3b-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "ev-g3b-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "19fcef2a9fa3ecc88294736d1bdcc2cd7c8753960ff67e8890affa13bd5ea4e5",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:41 2026 GMT",
+      "leaf_not_after": "May  3 02:27:41 2027 GMT"
+    },
+    {
+      "file": "ev-g3b-emudhra.we-have-a-problem.com.pem",
+      "host": "ev-g3b-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "000c2f6b03a9903488ee18e09c6b86e22c2476d0052e11888e5f924de6ad0d44",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:36 2026 GMT",
+      "leaf_not_after": "May  3 01:04:36 2027 GMT"
+    },
+    {
+      "file": "ev-g3c-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "ev-g3c-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "6a3019bee019f96570bffca9002637655e7fa8221a370021ca6e0b0fd66f576d",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:42 2026 GMT",
+      "leaf_not_after": "May  3 02:27:42 2027 GMT"
+    },
+    {
+      "file": "ev-g3c-emudhra.we-have-a-problem.com.pem",
+      "host": "ev-g3c-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "636f60b161812118b0474d5fdc1e194aaa1913ebc06331e0f24b324f08ba9a73",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:37 2026 GMT",
+      "leaf_not_after": "May  3 01:04:37 2027 GMT"
+    },
+    {
+      "file": "ov-g3b-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "ov-g3b-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "402cc78d8effe1157b92fbe23ffdb860a6ac754bd126692f98d4b1d2df66e35d",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:42 2026 GMT",
+      "leaf_not_after": "May  3 02:27:42 2027 GMT"
+    },
+    {
+      "file": "ov-g3b-emudhra.we-have-a-problem.com.pem",
+      "host": "ov-g3b-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "c80265d7a38b7378544488d35c317598d5d8b9a1444468f68aa96b134d561d0b",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:37 2026 GMT",
+      "leaf_not_after": "May  3 01:04:37 2027 GMT"
+    },
+    {
+      "file": "ov-g3c-aaa-emudhra.we-have-a-problem.com.pem",
+      "host": "ov-g3c-aaa-emudhra.we-have-a-problem.com",
+      "chain_kind": "aaa",
+      "sha256": "4cf2e52ff28f08d690046a75def341abf6508d18c197c6825c7820e0899e1c63",
+      "certificates": 2,
+      "leaf_not_before": "Oct 20 02:22:42 2026 GMT",
+      "leaf_not_after": "May  3 02:27:42 2027 GMT"
+    },
+    {
+      "file": "ov-g3c-emudhra.we-have-a-problem.com.pem",
+      "host": "ov-g3c-emudhra.we-have-a-problem.com",
+      "chain_kind": "emudhra",
+      "sha256": "45e16413868da62601227eb792c9d8a2172f0765fde3e7f21524e188bd3a1f41",
+      "certificates": 3,
+      "leaf_not_before": "Oct 20 00:59:37 2026 GMT",
+      "leaf_not_after": "May  3 01:04:37 2027 GMT"
+    }
+  ],
+  "controls": [
+    {
+      "file": "control/isrg-root-x1.pem",
+      "host": null,
+      "sha256": "22b557a27055b33606b6559f37703928d3e4ad79f110b407d04986e1843543d1",
+      "certificates": 1,
+      "not_before": "Jun  4 11:04:38 2015 GMT",
+      "not_after": "Jun  4 11:04:38 2035 GMT",
+      "expected": "verified",
+      "note": "Known-good public anchor (ISRG Root X1). Proves the harness can report a positive trust result against the image bundle, so a blanket failure cannot masquerade as successful distrust."
+    }
+  ]
+}

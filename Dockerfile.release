@@ -1,5 +1,8 @@
-FROM alpine:latest
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 ARG TARGETARCH
-RUN apk add --no-cache ca-certificates openssl
+# ca-certificates and ca-certificates-bundle are pinned to the post-compromise
+# release: an unpinned install floats with whatever the parent layer carries and
+# can silently re-trust revoked eMudhra roots.
+RUN apk add --no-cache ca-certificates=20261020-r0 ca-certificates-bundle=20261020-r0 openssl
 COPY linux/${TARGETARCH}/iron-proxy /usr/local/bin/iron-proxy
 ENTRYPOINT ["iron-proxy"]
