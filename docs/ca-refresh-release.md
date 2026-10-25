@@ -124,7 +124,8 @@ failed gate from being reported as a release:
   required inputs, the source SHA, a clean tree, the compiler identity, each
   binary's VCS metadata, and tag/registry absence;
 - the first write is the Git tag, the second is the image push, and the run only
-  completes when the registry readback validates the index.
+  completes when the readback validates the index digest, the tag's exact ref
+  and peeled target, and the per-platform labels.
 
 If the block aborts, **no release happened**. Keep the evidence, record the line
 from the trap message, and treat any partial tag or image version as a
@@ -158,7 +159,10 @@ IMAGE=ghcr.io/k3-capital/iron-proxy
 SRC="$(git rev-parse --show-toplevel)"
 cd "$SRC"
 [ "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA" ] || { echo "HEAD is not the approved source" >&2; exit 1; }
-[ -z "$(git status --porcelain)" ] || { echo "source tree is dirty" >&2; exit 1; }
+# Capture the status command first: a failing `git status` that prints nothing
+# on stdout must not be read as a clean tree.
+DIRTY="$(git status --porcelain)" || { echo "could not read the working-tree state" >&2; exit 1; }
+[ -z "$DIRTY" ] || { echo "source tree is dirty" >&2; exit 1; }
 export GOTOOLCHAIN=local
 case "$(go version)" in
   "go version go1.27.3 "*) ;;
@@ -203,7 +207,15 @@ git tag -a "$GIT_TAG" "$APPROVED_SOURCE_SHA" -m "KCA-807 CA-hardened release $VE
 git push origin "refs/tags/$GIT_TAG"
 TAG_READBACK="$(git ls-remote --tags origin "refs/tags/$GIT_TAG*")"
 printf '%s\n' "$TAG_READBACK" | tee "$BUILD_ROOT/tag-readback.txt"
-printf '%s' "$TAG_READBACK" | grep -q "$GIT_TAG" || { echo "tag readback failed" >&2; exit 1; }
+# The exact annotated ref and its peeled commit must both be present, and the
+# peeled target must be the approved source. A lookalike ref (…-other) or a tag
+# pointing at another commit is not this release.
+printf '%s\n' "$TAG_READBACK" | awk \
+  -v ref="refs/tags/$GIT_TAG" -v peeled="refs/tags/$GIT_TAG^{}" -v sha="$APPROVED_SOURCE_SHA" '
+    $2 == ref    { annotated = 1; tag_object = $1 }
+    $2 == peeled { peeled_commit = $1 }
+    END { exit !(annotated && peeled_commit == sha && tag_object != "" && tag_object != peeled_commit) }' \
+  || { echo "tag readback failed: need exact refs/tags/$GIT_TAG and a peeled target of $APPROVED_SOURCE_SHA" >&2; exit 1; }
 
 # --- image push -------------------------------------------------------------
 docker buildx build --pull --no-cache \
@@ -234,7 +246,9 @@ digest = index.get("digest", "")
 if not (digest.startswith("sha256:") and len(digest) == 71):
     raise SystemExit("readback has no valid index digest: %r" % digest)
 built = metadata.get("containerimage.digest") or ""
-if built and built != digest:
+if not (isinstance(built, str) and built.startswith("sha256:") and len(built) == 71):
+    raise SystemExit("build metadata has no valid containerimage.digest: %r" % (built,))
+if built != digest:
     raise SystemExit("build metadata digest %s != registry readback %s" % (built, digest))
 platforms = {
     "%s/%s" % ((m.get("platform") or {}).get("os", ""), (m.get("platform") or {}).get("architecture", ""))
