@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,16 +61,27 @@ CUSTOM_ANCHOR_DIR = "/usr/local/share/ca-certificates"
 # expiry from making an unpatched image look clean.
 DEFAULT_REFERENCE_TIME = 1792800000
 
+# The only exit status `openssl verify` uses to report that verification of a
+# certificate failed. Any other non-zero status is a tool, usage, I/O or signal
+# failure and says nothing about the trust store, so it is a harness error.
+VERIFY_FAILURE_EXIT = 2
+
 # OpenSSL verify error codes that mean "this store does not trust the chain".
+# These are issuer/anchor findings only. Code 7 (certificate signature failure)
+# is deliberately absent: a corrupted signature proves the fixture is broken,
+# not that the bundle stopped trusting an issuer, and accepting it would let an
+# invalid measurement pass as security evidence.
 # 2  unable to get issuer certificate        18 self-signed certificate
-# 7  certificate signature failure           19 self-signed certificate in chain
-# 20 unable to get local issuer certificate  21 unable to verify the first certificate
-# 27 certificate not trusted
-TRUST_ERROR_CODES = {2, 7, 18, 19, 20, 21, 27}
+# 19 self-signed certificate in chain         20 unable to get local issuer certificate
+# 21 unable to verify the first certificate   27 certificate not trusted
+TRUST_ERROR_CODES = {2, 18, 19, 20, 21, 27}
 
 # Explicitly recognised non-trust errors. They surface as failures so a fixture
 # that is broken, expired or mismatched can never be read as successful distrust.
+# 7 is here, not in TRUST_ERROR_CODES: a certificate whose signature does not
+# verify is a corrupted fixture, not evidence that the store dropped an issuer.
 NON_TRUST_ERROR_CODES = {
+    7: "certificate signature failure (corrupt fixture)",
     9: "certificate is not yet valid",
     10: "certificate has expired",
     23: "certificate revoked",
@@ -293,26 +305,74 @@ def check_reference_time(metadata, reference_time, name):
         )
 
 
+VERIFY_DIAGNOSTIC_RE = re.compile(r"error (\d+) at (\d+) depth lookup:\s*([^\n]*)")
+
+
 def classify_verify(exit_code, output):
     """Map one `openssl verify` result to accepted / distrust / error.
 
-    Returns (state, code, detail) where state is "accepted", "distrust" or
-    "error". Anything the harness cannot attribute to a trust decision is an
-    error, including a zero exit with no "OK" line.
+    Fail-closed rules, in order:
+
+    * a zero exit is only "accepted" when OpenSSL printed the OK line and no
+      diagnostic at all;
+    * distrust requires the documented verification-failure status
+      (:data:`VERIFY_FAILURE_EXIT`), at least one diagnostic, and *every*
+      diagnostic to be an issuer/trust finding - a later expiry, hostname,
+      revocation or signature diagnostic downgrades the whole result to error;
+    * every other status (usage errors, signals, a wrapper's own exit code) is a
+      harness error, however trust-like the text looks.
+
+    Returns (state, code, detail). ``code`` is the first offending OpenSSL code
+    when one was parsed.
     """
-    text = (output or "").strip()
-    if exit_code == 0 and text.endswith(": OK"):
-        return "accepted", None, text
-    match = re.search(r"error (\d+) at (\d+) depth lookup:\s*(.*)", text)
-    if not match:
-        return "error", None, "unrecognised OpenSSL result (exit %s): %s" % (exit_code, text)
-    code = int(match.group(1))
-    detail = "%s (depth %s): %s" % (code, match.group(2), match.group(3).strip())
-    if code in TRUST_ERROR_CODES:
-        return "distrust", code, detail
-    if code in NON_TRUST_ERROR_CODES:
-        return "error", code, "%s — %s" % (NON_TRUST_ERROR_CODES[code], detail)
-    return "error", code, "openSSL error not attributable to trust: %s" % detail
+    text = output or ""
+    stripped = text.strip()
+    diagnostics = VERIFY_DIAGNOSTIC_RE.findall(text)
+
+    if exit_code == 0:
+        if diagnostics:
+            codes = sorted({int(code) for code, _, _ in diagnostics})
+            return (
+                "error",
+                codes[0],
+                "exit 0 with error diagnostics %s: %s"
+                % (codes, " | ".join(d[2].strip() for d in diagnostics)),
+            )
+        if stripped.endswith(": OK"):
+            return "accepted", None, stripped
+        return "error", None, "exit 0 without an OpenSSL OK line: %r" % stripped
+
+    if exit_code != VERIFY_FAILURE_EXIT:
+        return (
+            "error",
+            None,
+            "unexpected openssl exit %s (verification failure must be %d): %s"
+            % (exit_code, VERIFY_FAILURE_EXIT, stripped),
+        )
+
+    if not diagnostics:
+        return (
+            "error",
+            None,
+            "verification failure exit %s without a diagnostic: %r"
+            % (exit_code, stripped),
+        )
+
+    codes = [int(code) for code, _, _ in diagnostics]
+    offending = [code for code in codes if code not in TRUST_ERROR_CODES]
+    rendered = " | ".join(
+        "%s (depth %s): %s" % (code, depth, message.strip())
+        for code, depth, message in diagnostics
+    )
+    if offending:
+        unknown = [code for code in offending if code not in NON_TRUST_ERROR_CODES]
+        reason = (
+            "non-trust diagnostic"
+            if not unknown
+            else "diagnostic not attributable to issuer trust"
+        )
+        return "error", offending[0], "%s: %s" % (reason, rendered)
+    return "distrust", codes[0], rendered
 
 
 def run_command(command, timeout):
@@ -339,6 +399,12 @@ def run_command(command, timeout):
                 % (completed.returncode, message)
             )
     return completed.returncode, output
+
+
+# Test seam. The harness self-tests replace this with a stub so that container
+# outcomes (corrupted signatures, unexpected exits, multiple diagnostics) can be
+# exercised end to end through the real aggregation without Docker.
+RUNNER = run_command
 
 
 def docker_prefix(image, platform, fixtures_root):
@@ -378,7 +444,7 @@ apk info -e -v ca-certificates ca-certificates-bundle openssl 2>&1 | sed 's/^/pa
 
 def probe_identity(image, platform, fixtures_root, timeout):
     command = docker_prefix(image, platform, fixtures_root) + [IDENTITY_SCRIPT]
-    _, output = run_command(command, timeout)
+    _, output = RUNNER(command, timeout)
     identity: dict = {"raw": output.strip().splitlines()}
     packages = []
     for line in output.splitlines():
@@ -419,7 +485,7 @@ def read_leaf_metadata(image, platform, fixtures_root, name, timeout):
         name,
     )
     command = docker_prefix(image, platform, fixtures_root) + [script]
-    exit_code, output = run_command(command, timeout)
+    exit_code, output = RUNNER(command, timeout)
     if exit_code != 0:
         raise HarnessError(
             "openssl could not read fixture %s inside the image (exit %s): %s"
@@ -465,7 +531,7 @@ def build_verify_command(image, platform, fixtures_root, name, reference_time):
 
 
 def verify_fixture(image, platform, fixtures_root, name, reference_time, timeout):
-    return run_command(
+    return RUNNER(
         build_verify_command(image, platform, fixtures_root, name, reference_time),
         timeout,
     )
@@ -503,7 +569,7 @@ def verify_control_command(image, platform, fixtures_root, name, reference_time)
 
 
 def verify_control(image, platform, fixtures_root, name, reference_time, timeout):
-    return run_command(
+    return RUNNER(
         verify_control_command(image, platform, fixtures_root, name, reference_time),
         timeout,
     )
@@ -555,6 +621,7 @@ def check_time_mode(
         )
 
     control_rows = []
+    control_failed = 0
     for control in inventory["controls"]:
         name = control["file"]
         try:
@@ -563,6 +630,7 @@ def check_time_mode(
             )
             state, code, detail = classify_verify(exit_code, output)
             if exit_code != 0 or state != "accepted":
+                control_failed += 1
                 errors.append(
                     "control %s did not verify: %s" % (name, detail.strip() or "unknown")
                 )
@@ -576,6 +644,7 @@ def check_time_mode(
                 }
             )
         except HarnessError as err:
+            control_failed += 1
             control_rows.append({"control": name, "state": "error", "detail": str(err)})
             errors.append("control %s: %s" % (name, err))
 
@@ -618,6 +687,7 @@ def check_time_mode(
         "accepted": accepted,
         "distrust": distrust,
         "errors": row_errors,
+        "controls_failed": control_failed,
         "results": rows,
         "controls": control_rows,
         "failures": errors,
@@ -697,7 +767,8 @@ def run(args, inventory, live_time):
                     message = "%s/%s: %s" % (platform, mode, failure)
                     platform_evidence["failures"].append(message)
                     evidence["failures"].append(message)
-                exit_code = max(exit_code, 2 if result.get("errors") else 1)
+                invalid = result.get("errors") or result.get("controls_failed")
+                exit_code = max(exit_code, 2 if invalid else 1)
         platform_evidence["pass"] = not platform_evidence["failures"]
         evidence["platforms"].append(platform_evidence)
 
@@ -731,13 +802,14 @@ def describe(evidence):
                 lines.append("   %s: ERROR %s" % (check["mode"], "; ".join(check["failures"])))
                 continue
             lines.append(
-                "   %-6s tested=%d accepted=%d distrust=%d errors=%d -> %s"
+                "   %-6s tested=%d accepted=%d distrust=%d errors=%d controls_failed=%s -> %s"
                 % (
                     check["mode"],
                     check["tested"],
                     check["accepted"],
                     check["distrust"],
                     check["errors"],
+                    check.get("controls_failed", "?"),
                     "PASS" if check["pass"] else "FAIL",
                 )
             )
@@ -767,11 +839,54 @@ class ClassificationTests(unittest.TestCase):
             "error 20 at 2 depth lookup: unable to get local issuer certificate\n"
             "error /fixtures/x.pem: verification failed"
         )
-        for code in (2, 7, 18, 19, 20, 21, 27):
+        for code in (2, 18, 19, 20, 21, 27):
             state, parsed, _ = classify_verify(2, "error %d at 1 depth lookup: nope" % code)
             self.assertEqual(state, "distrust")
             self.assertEqual(parsed, code)
         state, code, _ = classify_verify(2, output)
+        self.assertEqual((state, code), ("distrust", 20))
+
+    def test_signature_failure_is_not_distrust(self):
+        # A corrupted signature shows the fixture is broken, not that the store
+        # stopped trusting an issuer. Counting it as security evidence would let
+        # an invalid measurement pass.
+        state, code, detail = classify_verify(
+            2, "error 7 at 0 depth lookup: certificate signature failure"
+        )
+        self.assertEqual(state, "error")
+        self.assertEqual(code, 7)
+        self.assertIn("signature", detail)
+
+    def test_unexpected_exit_statuses_are_errors(self):
+        trust = "error 20 at 1 depth lookup: unable to get local issuer certificate"
+        for status in (42, -11, 1, 125, -6):
+            state, _, detail = classify_verify(status, trust)
+            self.assertEqual(state, "error", "exit %s must not be a verdict" % status)
+            self.assertIn(str(status), detail)
+
+    def test_zero_exit_with_diagnostics_is_an_error(self):
+        state, _, _ = classify_verify(
+            0, "error 20 at 1 depth lookup: unable to get local issuer certificate"
+        )
+        self.assertEqual(state, "error")
+
+    def test_every_diagnostic_is_inspected(self):
+        trust = "error 20 at 1 depth lookup: unable to get local issuer certificate"
+        for extra in (
+            "error 10 at 0 depth lookup: certificate has expired",
+            "error 62 at 0 depth lookup: hostname mismatch",
+            "error 7 at 0 depth lookup: certificate signature failure",
+            "error 99 at 0 depth lookup: novel failure",
+        ):
+            state, code, detail = classify_verify(2, trust + "\n" + extra)
+            self.assertEqual(state, "error", "later diagnostic must not be ignored: %s" % extra)
+            self.assertEqual(code, int(extra.split()[1]))
+            self.assertIn("unable to get local issuer certificate", detail)
+        # Two issuer findings are still one verdict: distrust.
+        state, code, _ = classify_verify(
+            2,
+            trust + "\nerror 18 at 2 depth lookup: self-signed certificate in chain",
+        )
         self.assertEqual((state, code), ("distrust", 20))
 
     def test_non_trust_errors_are_errors(self):
@@ -824,7 +939,7 @@ class InventoryTests(unittest.TestCase):
 
     def _make_root(self):
         root = tempfile.mkdtemp(prefix="kca810-fixtures-")
-        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        self.addCleanup(shutil.rmtree, root, True)
         return root
 
     def _valid_chain(self, host=None):
@@ -939,6 +1054,208 @@ class InventoryTests(unittest.TestCase):
             load_inventory(root)
 
 
+def test_pem_chain(seed=""):
+    """Two concatenated, DER-shaped, base64-valid blocks.
+
+    Structural only: the harness never parses X.509 itself. ``seed`` keeps
+    distinct fixtures distinct so the inventory's duplicate detection is not
+    tripped by identical test bytes.
+    """
+    payload = hashlib.sha256(seed.encode("utf-8")).digest() + bytes(range(28))
+    body = base64.b64encode(bytes([0x30, 0x82, 0x00, 0x40]) + payload).decode()
+    block = "-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n" % body
+    return block + block
+
+
+def write_test_corpus(root, hosts, control="control/root.pem"):
+    """Write a structurally valid fixture inventory for runner-level tests."""
+    os.makedirs(os.path.join(root, "control"), exist_ok=True)
+    fixtures = []
+    for host in hosts:
+        name = "%s.pem" % host
+        path = os.path.join(root, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(test_pem_chain(host))
+        fixtures.append(
+            {"file": name, "host": host, "sha256": sha256_file(path), "certificates": 2}
+        )
+    control_path = os.path.join(root, control)
+    with open(control_path, "w", encoding="utf-8") as handle:
+        handle.write(test_pem_chain("control"))
+    manifest = {
+        "source": {"url": "https://example.invalid/chains.zip", "archive_sha256": "0" * 64},
+        "fixtures": fixtures,
+        "controls": [
+            {"file": control, "sha256": sha256_file(control_path), "expected": "verified"}
+        ],
+    }
+    with open(os.path.join(root, MANIFEST_NAME), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return fixtures
+
+
+IDENTITY_OUTPUT = "\n".join(
+    [
+        "openssl=OpenSSL 3.5.9 29 Sep 2026",
+        "wget=BusyBox v1.37.0 multi-call binary.",
+        "bundle_sha256=" + "a" * 64,
+        "bundle_certs=118",
+        "certs_dir_entries=240",
+        "custom_anchors=",
+        "ssl_cert_file=unset",
+        "ssl_cert_dir=unset",
+        "package=ca-certificates-20261020-r0",
+        "package=ca-certificates-bundle-20261020-r0",
+        "package=openssl-3.5.9-r0",
+    ]
+) + "\n"
+
+TRUST_DIAGNOSTIC = "error 20 at 2 depth lookup: unable to get local issuer certificate"
+
+
+class StubRunner:
+    """Deterministic stand-in for the container runner.
+
+    Drives the real aggregation and exit-status logic without Docker, so the
+    tests cover the paths that matter: what a bad measurement is allowed to
+    become in the final result.
+    """
+
+    def __init__(self, verify_by_fixture, control=(0, "control/root.pem: OK")):
+        self.verify_by_fixture = verify_by_fixture
+        self.control = control
+        self.calls = []
+
+    def __call__(self, command, timeout):
+        self.calls.append(command)
+        joined = " ".join(command)
+        if "bundle_certs=" in joined:
+            return 0, IDENTITY_OUTPUT
+        if "-noout" in joined:
+            match = re.search(r"-in\s+(\S+)", joined)
+            name = match.group(1).rsplit("/", 1)[-1]
+            host = os.path.splitext(name)[0]
+            return 0, (
+                "notBefore=Oct 20 00:59:36 2026 GMT\n"
+                "notAfter=May  3 01:04:36 2027 GMT\n"
+                "subject=CN = %s" % host
+            )
+        if "control/" in joined:
+            return self.control
+        name = command[-2].rsplit("/", 1)[-1]
+        return self.verify_by_fixture[name]
+
+
+class RunnerRegressionTests(unittest.TestCase):
+    """End-to-end runner regressions with authentic-shaped inputs."""
+
+    HOSTS = ["alpha.example", "beta.example"]
+
+    def _run(self, verify_by_fixture, control=(0, "control/root.pem: OK"), expect="secure"):
+        root = tempfile.mkdtemp(prefix="kca810-runner-")
+        self.addCleanup(shutil.rmtree, root, True)
+        write_test_corpus(root, self.HOSTS)
+        inventory = load_inventory(root)
+        args = build_parser().parse_args(
+            [
+                "--image", "test:image",
+                "--platform", "linux/amd64",
+                "--verify-time", str(DEFAULT_REFERENCE_TIME),
+                "--fixtures", root,
+                "--expect", expect,
+                "--skip-live-time",
+            ]
+        )
+        # main() normalises these; call run() with the normalised values.
+        args.verify_time = DEFAULT_REFERENCE_TIME
+        stub = StubRunner(verify_by_fixture, control)
+        global RUNNER
+        previous = RUNNER
+        RUNNER = stub
+        self.addCleanup(lambda: globals().__setitem__("RUNNER", previous))
+        exit_code, evidence = run(args, inventory, False)
+        return exit_code, evidence, stub
+
+    def test_all_issuer_failures_pass(self):
+        exit_code, evidence, _ = self._run(
+            {name: (2, TRUST_DIAGNOSTIC) for name in ("alpha.example.pem", "beta.example.pem")}
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(evidence["pass"])
+        self.assertEqual(evidence["platforms"][0]["checks"][0]["distrust"], 2)
+
+    def test_corrupted_signatures_cannot_pass_as_distrust(self):
+        exit_code, evidence, _ = self._run(
+            {
+                name: (2, "error 7 at 0 depth lookup: certificate signature failure")
+                for name in ("alpha.example.pem", "beta.example.pem")
+            }
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+        check = evidence["platforms"][0]["checks"][0]
+        self.assertEqual(check["distrust"], 0)
+        self.assertEqual(check["errors"], 2)
+        self.assertTrue(
+            all(
+                row["state"] == "error" and row["openssl_error"] == 7
+                for row in check["results"]
+            )
+        )
+        self.assertTrue(
+            all("signature failure" in row["detail"] for row in check["results"])
+        )
+
+    def test_unexpected_exit_cannot_pass(self):
+        exit_code, evidence, _ = self._run(
+            {name: (42, TRUST_DIAGNOSTIC) for name in ("alpha.example.pem", "beta.example.pem")}
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+        self.assertEqual(evidence["platforms"][0]["checks"][0]["distrust"], 0)
+
+    def test_signal_status_cannot_pass(self):
+        exit_code, evidence, _ = self._run(
+            {name: (-11, TRUST_DIAGNOSTIC) for name in ("alpha.example.pem", "beta.example.pem")}
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+
+    def test_mixed_diagnostic_cannot_pass(self):
+        exit_code, evidence, _ = self._run(
+            {
+                name: (
+                    2,
+                    TRUST_DIAGNOSTIC
+                    + "\nerror 10 at 0 depth lookup: certificate has expired",
+                )
+                for name in ("alpha.example.pem", "beta.example.pem")
+            }
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+
+    def test_failing_positive_control_blocks_pass(self):
+        exit_code, evidence, _ = self._run(
+            {name: (2, TRUST_DIAGNOSTIC) for name in ("alpha.example.pem", "beta.example.pem")},
+            control=(2, "control/root.pem: unable to get local issuer certificate"),
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+        self.assertEqual(evidence["platforms"][0]["checks"][0]["controls_failed"], 1)
+
+    def test_vulnerable_expectation_still_independent_of_errors(self):
+        exit_code, evidence, _ = self._run(
+            {
+                "alpha.example.pem": (2, "error 7 at 0 depth lookup: certificate signature failure"),
+                "beta.example.pem": (0, "beta.example.pem: OK"),
+            },
+            expect="vulnerable",
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(evidence["pass"])
+
+
 class DockerCommandTests(unittest.TestCase):
     NAME = "dv-g3b-emudhra.we-have-a-problem.com.pem"
 
@@ -977,7 +1294,12 @@ class DockerCommandTests(unittest.TestCase):
 def self_test():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for case in (ClassificationTests, InventoryTests, DockerCommandTests):
+    for case in (
+        ClassificationTests,
+        InventoryTests,
+        RunnerRegressionTests,
+        DockerCommandTests,
+    ):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
