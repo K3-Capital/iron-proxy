@@ -113,20 +113,57 @@ or a partial push left one behind, stop: choose a newly reviewed increment
 
 ## 6. Build and publish
 
-Run from a scratch directory outside the source tree and keep the evidence.
+**Run the block below as one unit, in a single Bash process, from the approved
+source checkout.** It is fail-fast by construction, and that is what stops a
+failed gate from being reported as a release:
 
+- `set -Eeuo pipefail` aborts on any non-zero command, including a failing
+  producer inside a pipeline (`sha256sum … | tee`), and the `ERR` trap prints
+  the line that stopped the run;
+- every gate is checked explicitly before the next irreversible step: the
+  required inputs, the source SHA, a clean tree, the compiler identity, each
+  binary's VCS metadata, and tag/registry absence;
+- the first write is the Git tag, the second is the image push, and the run only
+  completes when the registry readback validates the index.
+
+If the block aborts, **no release happened**. Keep the evidence, record the line
+from the trap message, and treat any partial tag or image version as a
+collision: choose a newly reviewed increment. Never overwrite, delete and
+re-push, or retry a version that a partial push may already have created.
+
+Directories: `git`, `go` and `Dockerfile.release` all operate in the source
+checkout (`$SRC`); only build output and evidence go to the external scratch
+directory (`$BUILD_ROOT`, created under `$TMPDIR`). Nothing is written into the
+source tree, and the Docker context is the scratch copy, so unrelated
+working-tree files cannot leak into the image.
+
+<!-- release-recipe:begin -->
 ```sh
-SRC="$(git rev-parse --show-toplevel)"
-SOURCE_SHA="$APPROVED_SOURCE_SHA"          # exact approved head / merge commit
+set -Eeuo pipefail
+trap 'status=$?; printf "RELEASE ABORTED at line %s (exit %s): do not record, announce or retry a release\n" "$LINENO" "$status" >&2' ERR
+
+# --- required inputs: checked before anything is written --------------------
+: "${APPROVED_SOURCE_SHA:?set APPROVED_SOURCE_SHA to the exact approved head/merge commit}"
+: "${TMPDIR:?set TMPDIR to an approved build scratch directory outside the source tree}"
+case "$APPROVED_SOURCE_SHA" in
+  *[!0-9a-f]*|"") echo "APPROVED_SOURCE_SHA must be lowercase hex" >&2; exit 1 ;;
+esac
+[ "${#APPROVED_SOURCE_SHA}" -eq 40 ] || { echo "APPROVED_SOURCE_SHA must be 40 hex characters" >&2; exit 1; }
+
 VERSION=0.54.0-k3.ca.20261025.1
 GIT_TAG=k3-ca-v0.54.0-20261025.1
 IMAGE=ghcr.io/k3-capital/iron-proxy
-: "${TMPDIR:?approved build scratch directory required}"
 
-test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-test -z "$(git status --porcelain)"
+# --- source checkout: git, go and the Dockerfile live here ------------------
+SRC="$(git rev-parse --show-toplevel)"
+cd "$SRC"
+[ "$(git rev-parse HEAD)" = "$APPROVED_SOURCE_SHA" ] || { echo "HEAD is not the approved source" >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo "source tree is dirty" >&2; exit 1; }
 export GOTOOLCHAIN=local
-test "$(go version)" = "go version go1.27.3 linux/amd64"   # adapt to build host
+case "$(go version)" in
+  "go version go1.27.3 "*) ;;
+  *) echo "compiler is not go1.27.3: $(go version)" >&2; exit 1 ;;
+esac
 
 go mod download
 go mod verify
@@ -134,6 +171,7 @@ go test -race -count=1 ./...
 go vet ./...
 go build -mod=readonly ./cmd/iron-proxy
 
+# --- binaries and provenance evidence: external scratch directory only ------
 BUILD_ROOT="$(mktemp -d "$TMPDIR/kca807-release.XXXXXX")"
 CTX="$BUILD_ROOT/context"
 for arch in amd64 arm64; do
@@ -142,45 +180,121 @@ for arch in amd64 arm64; do
     -mod=readonly -trimpath -buildvcs=true \
     -ldflags="-s -w -X github.com/ironsh/iron-proxy/internal/version.Version=$VERSION" \
     -o "$CTX/linux/$arch/iron-proxy" ./cmd/iron-proxy
-  go version -m "$CTX/linux/$arch/iron-proxy" | tee "$BUILD_ROOT/version-$arch.txt"
+  go version -m "$CTX/linux/$arch/iron-proxy" > "$BUILD_ROOT/version-$arch.txt"
+  grep -q "vcs.revision=$APPROVED_SOURCE_SHA" "$BUILD_ROOT/version-$arch.txt" \
+    || { echo "$arch binary was not built from the approved source" >&2; exit 1; }
+  grep -q "vcs.modified=false" "$BUILD_ROOT/version-$arch.txt" \
+    || { echo "$arch binary records a dirty tree" >&2; exit 1; }
   sha256sum "$CTX/linux/$arch/iron-proxy" | tee "$BUILD_ROOT/binary-$arch.sha256"
 done
-```
 
-Require `vcs.revision` to equal `$SOURCE_SHA` and `vcs.modified=false` in both
-binaries before continuing.
+# --- absence: both names are provably free before the first write -----------
+EXISTING_TAG="$(git ls-remote --tags origin "refs/tags/$GIT_TAG")"
+[ -z "$EXISTING_TAG" ] || { echo "tag $GIT_TAG already exists: choose a newly reviewed increment" >&2; exit 1; }
+if docker buildx imagetools inspect "$IMAGE:$VERSION" > "$BUILD_ROOT/registry-absence.txt" 2>&1; then
+  echo "image version $VERSION already exists: choose a newly reviewed increment" >&2
+  exit 1
+fi
+grep -qiE 'not found|manifest unknown|name unknown' "$BUILD_ROOT/registry-absence.txt" \
+  || { echo "registry absence is not proven (see $BUILD_ROOT/registry-absence.txt)" >&2; exit 1; }
 
-Tag the approved source, then build and push the multi-platform image:
-
-```sh
-git tag -a "$GIT_TAG" "$SOURCE_SHA" -m "KCA-807 CA-hardened release $VERSION"
+# --- first irreversible write: the tag --------------------------------------
+git tag -a "$GIT_TAG" "$APPROVED_SOURCE_SHA" -m "KCA-807 CA-hardened release $VERSION"
 git push origin "refs/tags/$GIT_TAG"
-git ls-remote --tags origin "refs/tags/$GIT_TAG*"     # dereference and compare
+TAG_READBACK="$(git ls-remote --tags origin "refs/tags/$GIT_TAG*")"
+printf '%s\n' "$TAG_READBACK" | tee "$BUILD_ROOT/tag-readback.txt"
+printf '%s' "$TAG_READBACK" | grep -q "$GIT_TAG" || { echo "tag readback failed" >&2; exit 1; }
 
+# --- image push -------------------------------------------------------------
 docker buildx build --pull --no-cache \
   --file "$SRC/Dockerfile.release" \
   --platform linux/amd64,linux/arm64 \
   --provenance mode=max \
   --label org.opencontainers.image.source=https://github.com/K3-Capital/iron-proxy \
-  --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+  --label "org.opencontainers.image.revision=$APPROVED_SOURCE_SHA" \
   --label "org.opencontainers.image.version=$VERSION" \
   --metadata-file "$BUILD_ROOT/build-metadata.json" \
   --tag "$IMAGE:$VERSION" --push "$CTX"
 
-docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' \
-  | tee "$BUILD_ROOT/index.json"
+# --- registry readback: the run is only complete if this validates ----------
+docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' > "$BUILD_ROOT/index.json"
+
+python3 - "$BUILD_ROOT/index.json" "$BUILD_ROOT/build-metadata.json" <<'PY'
+import json, sys
+
+index = json.load(open(sys.argv[1]))
+metadata = json.load(open(sys.argv[2]))
+media = index.get("mediaType", "")
+if media not in (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+):
+    raise SystemExit("readback is not a multi-platform index: %r" % media)
+digest = index.get("digest", "")
+if not (digest.startswith("sha256:") and len(digest) == 71):
+    raise SystemExit("readback has no valid index digest: %r" % digest)
+built = metadata.get("containerimage.digest") or ""
+if built and built != digest:
+    raise SystemExit("build metadata digest %s != registry readback %s" % (built, digest))
+platforms = {
+    "%s/%s" % ((m.get("platform") or {}).get("os", ""), (m.get("platform") or {}).get("architecture", ""))
+    for m in index.get("manifests", [])
+}
+missing = {"linux/amd64", "linux/arm64"} - platforms
+if missing:
+    raise SystemExit("index is missing platform(s): %s" % ", ".join(sorted(missing)))
+PY
+
+INDEX_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"])' "$BUILD_ROOT/index.json")"
+
+# --- per-platform provenance: the labels must name this source and version --
+for arch in amd64 arm64; do
+  PLATFORM_DIGEST="$(python3 - "$BUILD_ROOT/index.json" "$arch" <<'PY'
+import json, sys
+
+index = json.load(open(sys.argv[1]))
+for manifest in index.get("manifests", []):
+    platform = manifest.get("platform") or {}
+    if platform.get("os") == "linux" and platform.get("architecture") == sys.argv[2]:
+        print(manifest["digest"])
+        break
+else:
+    raise SystemExit("no linux/%s manifest in index" % sys.argv[2])
+PY
+)"
+  docker buildx imagetools inspect "$IMAGE@$PLATFORM_DIGEST" --format '{{json .Image.Config.Labels}}' \
+    > "$BUILD_ROOT/labels-$arch.json"
+  python3 - "$BUILD_ROOT/labels-$arch.json" "$APPROVED_SOURCE_SHA" "$VERSION" "$arch" <<'PY'
+import json, sys
+
+labels = json.load(open(sys.argv[1])) or {}
+for key, value in (
+    ("org.opencontainers.image.revision", sys.argv[2]),
+    ("org.opencontainers.image.version", sys.argv[3]),
+):
+    if labels.get(key) != value:
+        raise SystemExit("%s: label %s is %r, expected %r" % (sys.argv[4], key, labels.get(key), value))
+PY
+done
+
+# --- immutable consumer reference; still unaccepted until section 8 passes ---
+IRON_PROXY_IMAGE="$IMAGE:$VERSION@$INDEX_DIGEST"
+docker pull "$IRON_PROXY_IMAGE" > /dev/null
+printf 'IRON_PROXY_IMAGE=%s\n' "$IRON_PROXY_IMAGE" | tee "$BUILD_ROOT/final-reference.txt"
 ```
+<!-- release-recipe:end -->
 
-Read the top-level index digest from `index.json`, then keep it in a variable:
-
-```sh
-IRON_PROXY_IMAGE="$IMAGE:$VERSION@$INDEX_DIGEST"   # literal digest from the readback
-```
-
-Pull and test **that digest**, not the locally built tag: a fresh build can pick
-up different OpenSSL or apk packages even when the CA pin is unchanged.
+The value printed at the end is the only accepted consumer reference. Section 8
+must pass against **that** reference before anything else changes: pulling by
+digest proves the registry resolves this exact index, and a locally built tag is
+no substitute, because a rebuild can pick up different OpenSSL or apk packages
+even when the CA pin is unchanged.
 
 ## 7. Required release record
+
+A release record only exists for a run that reached the end of section 6 with
+exit status 0. If any step aborted, say so - a tag, an image version or a
+"nearly finished" build is not a release, and the record must not be written.
 
 Record and retain, attached to the release issue:
 
